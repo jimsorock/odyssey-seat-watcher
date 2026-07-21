@@ -88,8 +88,16 @@ TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... python watch.py   # real run
 ## Changing what it watches
 
 All settings are constants at the top of [`watch.py`](watch.py):
-`TARGET_TIMES`, `DATE_START` / `DATE_END`, `WANTED_ROWS`, `SEAT_MIN` / `SEAT_MAX`,
-and `WANTED_SEAT_TYPES` (add `"companion"` if you'd accept a companion seat).
+`TARGET_TIMES`, `SEASON_START` / `DATE_END`, `WANTED_ROWS`, `SEAT_MIN` / `SEAT_MAX`,
+`WANTED_SEAT_TYPES` (add `"companion"` if you'd accept a companion seat), and
+`HEARTBEAT_EVERY_HOURS`.
+
+### Heartbeat
+
+Even when no seats are found, the watcher sends a periodic "still alive" message
+so you know it's running — every `HEARTBEAT_EVERY_HOURS` hours (default **6**). The
+first run sends one immediately as a delivery test, and any real seat alert resets
+the timer. Set `HEARTBEAT_EVERY_HOURS = 0` to turn heartbeats off.
 
 ---
 

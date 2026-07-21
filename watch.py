@@ -78,6 +78,11 @@ REDISCOVER_EVERY_MIN = 90
 # ~10 min. Set to 1 to disable sharding and check everything every run.
 SHARD_COUNT = 2
 
+# Send a "still alive, no matching seats yet" heartbeat at most this often
+# (hours), so you know the watcher is running even when there's nothing to alert.
+# Any real seat alert also resets this timer. Set to 0 to disable heartbeats.
+HEARTBEAT_EVERY_HOURS = 6
+
 STATE_FILE = "state.json"                  # cached across runs (see workflow)
 REQUEST_PAUSE = (1.1, 1.8)                 # random sleep range between requests
 MAX_RETRIES = 4                            # per request, on 429 / 5xx
@@ -340,6 +345,24 @@ def send_telegram(text, dry_run=False):
         log(f"  ! Telegram send failed: {r.status_code} {r.text[:200]}")
 
 
+def heartbeat_due(state):
+    if HEARTBEAT_EVERY_HOURS <= 0:
+        return False
+    last = state.get("heartbeat_ts", 0)
+    return (time.time() - last) >= HEARTBEAT_EVERY_HOURS * 3600
+
+
+def heartbeat_message(all_shows, available_count):
+    now = now_local().strftime("%Y-%m-%d %-I:%M %p %Z")
+    if available_count:
+        seat_note = (f"{available_count} matching seat(s) currently open "
+                     f"(already alerted).")
+    else:
+        seat_note = "No matching seats open yet."
+    return (f"\U0001F440 Odyssey watcher is alive — {now}\n"
+            f"Watching {len(all_shows)} upcoming showtime(s). {seat_note}")
+
+
 # ---- main -------------------------------------------------------------------
 
 def main():
@@ -375,11 +398,24 @@ def main():
     else:
         log("No matching seats available right now.")
 
+    sent = False
     if new_keys:
         log(f"NEW since last run: {sorted(new_keys)} — alerting.")
         send_telegram(format_message(hits, new_keys), dry_run=dry_run)
+        sent = True
     elif parsed_keys:
         log("Seats available but nothing new since last run — no alert.")
+
+    # Heartbeat: reassure that the watcher is running. Skipped if we already sent
+    # a real alert this run (you just heard from it), or if not yet due.
+    if not sent and heartbeat_due(state):
+        log("Heartbeat due — sending status message.")
+        send_telegram(heartbeat_message(all_shows, len(state["available"])),
+                      dry_run=dry_run)
+        sent = True
+
+    if sent and not dry_run:
+        state["heartbeat_ts"] = time.time()
 
     save_state(state)
 
