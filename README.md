@@ -3,8 +3,11 @@
 Polls Cinemark for **The Odyssey (IMAX 70mm)** at **Cinemark Dallas XD and IMAX**
 and sends a **Telegram** message when a seat opens up that matches:
 
-- **Dates:** today → 2026-08-13 (start advances daily so it never searches past
-  days; once today's 3:15 pm show has started, today is skipped entirely)
+- **Dates:** today → open-ended. The start advances daily so it never searches
+  past days (and once today's 3:15 pm show has started, today is skipped). There's
+  no fixed end date: discovery walks forward until it passes Cinemark's booking
+  horizon, so dates added later (e.g. beyond an original cutoff) are picked up
+  automatically.
 - **Times:** 11:30 am and 3:15 pm
 - **Seats:** rows **E–J**, seat numbers **7–21**
 
@@ -88,7 +91,7 @@ TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... python watch.py   # real run
 ## Changing what it watches
 
 All settings are constants at the top of [`watch.py`](watch.py):
-`TARGET_TIMES`, `SEASON_START` / `DATE_END`, `WANTED_ROWS`, `SEAT_MIN` / `SEAT_MAX`,
+`TARGET_TIMES`, `SEASON_START`, `WANTED_ROWS`, `SEAT_MIN` / `SEAT_MAX`,
 `WANTED_SEAT_TYPES` (add `"companion"` if you'd accept a companion seat), and
 `HEARTBEAT_EVERY_HOURS`.
 

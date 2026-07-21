@@ -52,11 +52,19 @@ TARGET_TIMES = {"11:30:00", "15:15:00"}    # 11:30 am and 3:15 pm
 # judged in this zone, NOT the GitHub runner's UTC.
 THEATER_TZ   = ZoneInfo("America/Chicago")
 
-# The date window is dynamic: it starts on the CURRENT date (so we never search
-# past days) and ends on DATE_END. SEASON_START is just a floor so we don't fetch
-# dates before the movie's run began.
+# The date window is fully dynamic. It starts on the CURRENT date (so we never
+# search past days; SEASON_START is just a floor so we don't probe dates before
+# the movie opened) and has NO fixed end: discovery walks forward until it passes
+# how far Cinemark has opened ticket sales, so newly-added dates are picked up
+# automatically. See discover_showtimes().
 SEASON_START = dt.date(2026, 7, 21)        # movie's first day (floor)
-DATE_END     = dt.date(2026, 8, 13)        # inclusive
+
+# Discovery walks forward until the theater has NO showtimes for ANY movie for
+# this many consecutive days (i.e. we've passed the booking horizon), then stops.
+# Using "any movie" — not just ours — means days our showtime doesn't play but
+# other films do are correctly walked past, not mistaken for the end of the run.
+STOP_AFTER_EMPTY_DAYS = 4
+MAX_LOOKAHEAD_DAYS    = 120                 # hard safety cap on how far to probe
 
 # Seat filter: rows E through J, seat numbers 7 through 21.
 WANTED_ROWS = {"E", "F", "G", "H", "I", "J"}
@@ -102,7 +110,11 @@ SEATMAP_URL = ("https://www.cinemark.com/TicketSeatMap/?TheaterId={theater}"
 
 LINK_RE = re.compile(
     r'TicketSeatMap/\?TheaterId=(\d+)&ShowtimeId=(\d+)'
-    r'&CinemarkMovieId=(\d+)&Showtime=(2026-\d\d-\d\dT\d\d:\d\d:\d\d)')
+    r'&CinemarkMovieId=(\d+)&Showtime=(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)')
+
+# Does this theater have ANY showtime (any movie) on the page? Used to detect the
+# end of Cinemark's booking window during discovery.
+ANY_SHOWTIME_RE = re.compile(r'TicketSeatMap/\?TheaterId=\d+&ShowtimeId=\d+')
 
 BUTTON_RE = re.compile(r'<button\b([^>]*)>')
 
@@ -112,13 +124,6 @@ SESSION.headers.update(HEADERS)
 
 def log(msg):
     print(f"[{dt.datetime.now():%H:%M:%S}] {msg}", flush=True)
-
-
-def date_range(start, end):
-    d = start
-    while d <= end:
-        yield d
-        d += dt.timedelta(days=1)
 
 
 def now_local():
@@ -173,15 +178,37 @@ def get(url):
 # ---- showtime discovery (cached) -------------------------------------------
 
 def discover_showtimes():
-    """Return list of dicts: {date, time, showtime_iso, showtime_id, url}."""
+    """Return list of dicts: {date, time, showtime_iso, showtime_id, url}.
+
+    Walks forward from start_date() with NO fixed end date, so dates Cinemark adds
+    later are picked up automatically. Stops once the theater has no showtimes at
+    all for STOP_AFTER_EMPTY_DAYS consecutive days (past the booking horizon), or
+    at the MAX_LOOKAHEAD_DAYS safety cap.
+    """
     found = []
-    for d in date_range(start_date(), DATE_END):
+    empty_streak = 0
+    d = start_date()
+    hard_end = now_local().date() + dt.timedelta(days=MAX_LOOKAHEAD_DAYS)
+    while d <= hard_end:
         iso = d.isoformat()
         try:
             page = html.unescape(get(f"{THEATER_SLUG_URL}?showDate={iso}"))
         except Exception as e:
             log(f"  ! failed to load showtimes for {iso}: {e}")
+            d += dt.timedelta(days=1)
             continue
+
+        # No showtimes for ANY movie -> we may have passed the booking horizon.
+        if not ANY_SHOWTIME_RE.search(page):
+            empty_streak += 1
+            if empty_streak >= STOP_AFTER_EMPTY_DAYS:
+                log(f"  no theater showtimes for {empty_streak} days through "
+                    f"{iso} — reached booking horizon, stopping.")
+                break
+            d += dt.timedelta(days=1)
+            continue
+        empty_streak = 0
+
         seen = set()
         for theater, sid, movie, when in LINK_RE.findall(page):
             if theater != THEATER_ID or movie != MOVIE_ID:
@@ -198,6 +225,7 @@ def discover_showtimes():
             })
         if seen:
             log(f"  {iso}: showtimes {sorted(seen)}")
+        d += dt.timedelta(days=1)
     return found
 
 
