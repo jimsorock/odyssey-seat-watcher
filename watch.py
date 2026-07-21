@@ -33,6 +33,7 @@ import html
 import random
 import datetime as dt
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -47,12 +48,19 @@ THEATER_SLUG_URL = "https://www.cinemark.com/theatres/tx-dallas/cinemark-dallas-
 MOVIE_ID     = "104867"                    # The Odyssey — IMAX 70mm (from your URL)
 TARGET_TIMES = {"11:30:00", "15:15:00"}    # 11:30 am and 3:15 pm
 
-DATE_START = dt.date(2026, 7, 21)
-DATE_END   = dt.date(2026, 8, 13)          # inclusive
+# The theater is in Dallas (Central Time). "Today" and "already started" are
+# judged in this zone, NOT the GitHub runner's UTC.
+THEATER_TZ   = ZoneInfo("America/Chicago")
+
+# The date window is dynamic: it starts on the CURRENT date (so we never search
+# past days) and ends on DATE_END. SEASON_START is just a floor so we don't fetch
+# dates before the movie's run began.
+SEASON_START = dt.date(2026, 7, 21)        # movie's first day (floor)
+DATE_END     = dt.date(2026, 8, 13)        # inclusive
 
 # Seat filter: rows E through J, seat numbers 7 through 21.
-WANTED_ROWS = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
-SEAT_MIN, SEAT_MAX = 1, 21
+WANTED_ROWS = {"E", "F", "G", "H", "I", "J"}
+SEAT_MIN, SEAT_MAX = 7, 21
 
 # Which seat types count as a real, bookable seat. "wheelchair" is a wheelchair
 # SPACE (no fixed seat) and "companion" is reserved beside it — excluded by
@@ -108,6 +116,34 @@ def date_range(start, end):
         d += dt.timedelta(days=1)
 
 
+def now_local():
+    return dt.datetime.now(THEATER_TZ)
+
+
+def showtime_dt(show):
+    """Timezone-aware start datetime of a showtime dict."""
+    return dt.datetime.fromisoformat(show["showtime_iso"]).replace(tzinfo=THEATER_TZ)
+
+
+def start_date():
+    """First date to search: today, or the movie's opening day if that's later.
+
+    Also rolls to tomorrow once today's last target showtime (e.g. 15:15) has
+    already started, so we don't keep scanning a day whose showings are over.
+    """
+    now = now_local()
+    d = max(SEASON_START, now.date())
+    if d == now.date() and now.strftime("%H:%M:%S") > max(TARGET_TIMES):
+        d += dt.timedelta(days=1)
+    return d
+
+
+def upcoming(shows):
+    """Drop showtimes that have already started (e.g. today's 11:30 at 1pm)."""
+    now = now_local()
+    return [s for s in shows if showtime_dt(s) > now]
+
+
 def get(url):
     """GET with polite pacing + retry/backoff on 429 and 5xx."""
     last_exc = None
@@ -134,7 +170,7 @@ def get(url):
 def discover_showtimes():
     """Return list of dicts: {date, time, showtime_iso, showtime_id, url}."""
     found = []
-    for d in date_range(DATE_START, DATE_END):
+    for d in date_range(start_date(), DATE_END):
         iso = d.isoformat()
         try:
             page = html.unescape(get(f"{THEATER_SLUG_URL}?showDate={iso}"))
@@ -311,12 +347,12 @@ def main():
     state = load_state()
 
     if "--list" in args:
-        for s in get_showtimes(state, force=True):
+        for s in upcoming(get_showtimes(state, force=True)):
             print(f"{s['showtime_iso']}  id={s['showtime_id']}  {s['url']}")
         return
 
     dry_run = "--dry-run" in args
-    all_shows = get_showtimes(state, force="--fresh" in args)
+    all_shows = upcoming(get_showtimes(state, force="--fresh" in args))
     shows, bucket = select_shard(all_shows, args)
     log(f"Shard {bucket + 1}/{SHARD_COUNT}: checking {len(shows)} "
         f"of {len(all_shows)} showtime(s).")

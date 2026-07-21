@@ -3,7 +3,8 @@
 Polls Cinemark for **The Odyssey (IMAX 70mm)** at **Cinemark Dallas XD and IMAX**
 and sends a **Telegram** message when a seat opens up that matches:
 
-- **Dates:** 2026-07-21 → 2026-08-13
+- **Dates:** today → 2026-08-13 (start advances daily so it never searches past
+  days; once today's 3:15 pm show has started, today is skipped entirely)
 - **Times:** 11:30 am and 3:15 pm
 - **Seats:** rows **E–J**, seat numbers **7–21**
 
