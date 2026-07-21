@@ -1,0 +1,41 @@
+name: Odyssey Seat Watcher
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub may delay scheduled runs a few minutes under load.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}          # lets you run it manually from the Actions tab
+
+concurrency:
+  group: seat-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      # Rolling cache: the unique run_id key always saves a fresh copy, and
+      # restore-keys pulls the most recent previous state.json. This is how the
+      # watcher remembers what was already available and only alerts on NEW seats.
+      - name: Restore previous state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: seatstate-${{ github.run_id }}
+          restore-keys: |
+            seatstate-
+
+      - name: Run watcher
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python watch.py
