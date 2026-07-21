@@ -51,8 +51,8 @@ DATE_START = dt.date(2026, 7, 21)
 DATE_END   = dt.date(2026, 8, 13)          # inclusive
 
 # Seat filter: rows E through J, seat numbers 7 through 21.
-WANTED_ROWS = {"E", "F", "G", "H", "I", "J"}
-SEAT_MIN, SEAT_MAX = 7, 21
+WANTED_ROWS = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
+SEAT_MIN, SEAT_MAX = 1, 21
 
 # Which seat types count as a real, bookable seat. "wheelchair" is a wheelchair
 # SPACE (no fixed seat) and "companion" is reserved beside it — excluded by
