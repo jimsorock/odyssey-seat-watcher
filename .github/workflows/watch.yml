@@ -2,8 +2,10 @@ name: Odyssey Seat Watcher
 
 on:
   schedule:
-    # Every 5 minutes. GitHub may delay scheduled runs a few minutes under load.
-    - cron: "*/5 * * * *"
+    # Every 5 minutes, offset off the top of the hour (:02,:07,:12,...). GitHub
+    # heavily delays/drops scheduled runs at :00, so avoiding it improves
+    # reliability. Scheduled runs are still best-effort and may lag under load.
+    - cron: "2-59/5 * * * *"
   workflow_dispatch: {}          # lets you run it manually from the Actions tab
 
 concurrency:
