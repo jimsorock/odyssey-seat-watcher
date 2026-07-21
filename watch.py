@@ -63,6 +63,13 @@ WANTED_SEAT_TYPES = {"seat"}
 # cached date->ShowtimeId map is reused, which keeps request volume low.
 REDISCOVER_EVERY_MIN = 90
 
+# Cinemark throttles at roughly ~30-35 requests per ~90s window (per IP). With
+# ~33 showtimes, checking them all in one run trips that. So we split them into
+# SHARD_COUNT groups and check one group per run, alternating each 5-min tick.
+# 2 shards -> ~16 requests/run (no throttling), each showtime checked every
+# ~10 min. Set to 1 to disable sharding and check everything every run.
+SHARD_COUNT = 2
+
 STATE_FILE = "state.json"                  # cached across runs (see workflow)
 REQUEST_PAUSE = (1.1, 1.8)                 # random sleep range between requests
 MAX_RETRIES = 4                            # per request, on 429 / 5xx
@@ -170,6 +177,28 @@ def get_showtimes(state, force=False):
         log("  ! discovery returned nothing; keeping previous cache.")
         shows = cached or []
     return shows
+
+
+# ---- sharding ---------------------------------------------------------------
+
+def select_shard(shows, args):
+    """Pick the subset of showtimes to check this run.
+
+    Showtimes are ordered and dealt round-robin into SHARD_COUNT groups (so each
+    group spans the whole date range, not one contiguous block). Which group runs
+    is chosen from the current 5-minute clock tick, so consecutive scheduled runs
+    alternate through the shards. Override with --shard=N for testing.
+    """
+    ordered = sorted(shows, key=lambda s: s["showtime_iso"])
+    if SHARD_COUNT <= 1:
+        return ordered, 0
+
+    bucket = int(time.time() // 300) % SHARD_COUNT   # which 5-min tick we're on
+    for a in args:
+        if a.startswith("--shard="):
+            bucket = int(a.split("=", 1)[1]) % SHARD_COUNT
+    shard = [s for i, s in enumerate(ordered) if i % SHARD_COUNT == bucket]
+    return shard, bucket
 
 
 # ---- seat parsing -----------------------------------------------------------
@@ -287,16 +316,21 @@ def main():
         return
 
     dry_run = "--dry-run" in args
-    shows = get_showtimes(state, force="--fresh" in args)
-    log(f"Checking {len(shows)} showtime(s).")
+    all_shows = get_showtimes(state, force="--fresh" in args)
+    shows, bucket = select_shard(all_shows, args)
+    log(f"Shard {bucket + 1}/{SHARD_COUNT}: checking {len(shows)} "
+        f"of {len(all_shows)} showtime(s).")
 
     hits, failed = scan(shows)
     parsed_keys = set(hits)
     previous = set(state.get("available", []))
 
-    # Carry forward seats we knew about but couldn't re-check this run, so a
-    # transient failure never drops state or triggers a false re-alert later.
-    carried = {k for k in previous if k.split(":")[0] in failed}
+    # Only showtimes we actually fetched OK this run give authoritative results.
+    # Carry forward known seats for showtimes we skipped (other shard) or that
+    # failed to load, so sharding/transient errors never drop state or trigger a
+    # false re-alert when the seat is "rediscovered" next cycle.
+    checked_ok = {s["showtime_id"] for s in shows} - failed
+    carried = {k for k in previous if k.split(":")[0] not in checked_ok}
     new_keys = parsed_keys - previous
     state["available"] = sorted(parsed_keys | carried)
 
