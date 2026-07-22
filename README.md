@@ -18,7 +18,7 @@ Runs every 5 minutes on **GitHub Actions** — no server, no cost.
 ## How it works
 
 1. `watch.py` reads the theater's showtimes page to find the `ShowtimeId` for each
-   target date/time (cached for 90 min, so most runs skip this).
+   target date/time.
 2. It fetches each seat map. Cinemark ships seat availability right in the page
    HTML (`available="True"` + `info="Row,Seat,..."`), so no browser is needed.
 3. It keeps only available seats in the wanted rows / seat-number range.
@@ -26,11 +26,23 @@ Runs every 5 minutes on **GitHub Actions** — no server, no cost.
    direct booking link. State is remembered between runs via the Actions cache, so
    you get pinged on new openings, not the same seat every 5 minutes.
 
-**Sharding:** Cinemark rate-limits at roughly ~30–35 requests per ~90s window, and
-there are ~33 showtimes to check — enough to get throttled if done all at once. So
-the showtimes are split into 2 shards (`SHARD_COUNT` in `watch.py`) and each 5-minute
-run checks one shard, alternating. Each run makes ~16 requests (no throttling, ~45s),
-and every showtime is checked about **every 10 minutes**.
+### Staying under Cinemark's rate limit
+
+Cinemark throttles at roughly **~30–35 requests per ~90s window** (per IP), and with
+the open-ended date range there can be dozens of dates and showtimes. Two mechanisms
+keep every run well under that cap (and under the Actions job timeout):
+
+- **Incremental discovery** (`DISCO_BATCH_DATES`): instead of scanning the whole date
+  horizon each run, a persistent cursor probes a handful of dates per run and advances
+  across successive runs, looping when it passes the booking horizon. The full horizon
+  refreshes every ~5 runs (~25 min), so newly-added dates are picked up automatically.
+- **Adaptive sharding** (`MAX_SEATMAPS_PER_RUN`): seat maps are split into shards, one
+  checked per 5-minute run (alternating). The number of shards scales with how many
+  showtimes exist, so a run never fetches more than `MAX_SEATMAPS_PER_RUN` seat maps.
+  More dates → more shards → each showtime is checked every *(shards × 5)* minutes.
+
+Net effect: a run makes roughly 20–24 requests total and finishes in well under a
+minute, regardless of how many dates get added.
 
 ---
 
@@ -92,8 +104,9 @@ TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... python watch.py   # real run
 
 All settings are constants at the top of [`watch.py`](watch.py):
 `TARGET_TIMES`, `SEASON_START`, `WANTED_ROWS`, `SEAT_MIN` / `SEAT_MAX`,
-`WANTED_SEAT_TYPES` (add `"companion"` if you'd accept a companion seat), and
-`HEARTBEAT_EVERY_HOURS`.
+`WANTED_SEAT_TYPES` (add `"companion"` if you'd accept a companion seat),
+`HEARTBEAT_EVERY_HOURS`, and the throttle knobs `DISCO_BATCH_DATES` /
+`MAX_SEATMAPS_PER_RUN`.
 
 ### Heartbeat
 
@@ -109,9 +122,9 @@ the timer. Set `HEARTBEAT_EVERY_HOURS = 0` to turn heartbeats off.
 - **Timing:** GitHub's scheduled runs can be delayed a few minutes when their
   queue is busy — treat "every 5 minutes" as approximate.
 - **Politeness / rate limits:** requests are paced ~1.5s apart with retry-and-
-  backoff, and sharded (see above) so each run stays under Cinemark's ~30-request
-  window. If you lower `SHARD_COUNT` to 1, expect `429 Too Many Requests` and
-  ~10-minute runs as the backoff grinds through them.
+  backoff, plus incremental discovery and adaptive sharding (see above) so each run
+  stays under Cinemark's ~30-request window. Raising `DISCO_BATCH_DATES` or
+  `MAX_SEATMAPS_PER_RUN` too high brings back `429 Too Many Requests` and long runs.
 - **Carrying seats over:** if a page fails to load, that showtime's previously
   known seats are kept so you don't get a false "gone then back" re-alert.
 - **This is best-effort:** hot showtimes can sell out in the gap between checks.

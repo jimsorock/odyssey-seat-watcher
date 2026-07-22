@@ -30,6 +30,7 @@ import sys
 import time
 import json
 import html
+import math
 import random
 import datetime as dt
 from urllib.parse import quote
@@ -56,7 +57,7 @@ THEATER_TZ   = ZoneInfo("America/Chicago")
 # search past days; SEASON_START is just a floor so we don't probe dates before
 # the movie opened) and has NO fixed end: discovery walks forward until it passes
 # how far Cinemark has opened ticket sales, so newly-added dates are picked up
-# automatically. See discover_showtimes().
+# automatically. See advance_discovery().
 SEASON_START = dt.date(2026, 7, 21)        # movie's first day (floor)
 
 # Discovery walks forward until the theater has NO showtimes for ANY movie for
@@ -75,16 +76,21 @@ SEAT_MIN, SEAT_MAX = 7, 21
 # default. Add "companion" here if you'd take one.
 WANTED_SEAT_TYPES = {"seat"}
 
-# Re-run showtime discovery at most this often (minutes). Between refreshes the
-# cached date->ShowtimeId map is reused, which keeps request volume low.
-REDISCOVER_EVERY_MIN = 90
+# Cinemark throttles at ~30-35 requests per ~90s window (per IP), so we cap how
+# many requests a single run makes. Two knobs below keep every run well under it:
+#
+# Incremental discovery: rather than sweeping the whole horizon every run (which
+# blew past the throttle AND the job timeout), a persistent cursor probes at most
+# this many dates per run, advancing through the horizon over successive runs. The
+# full horizon (~40+ days) refreshes every ~(horizon / DISCO_BATCH_DATES) runs, so
+# newly-added dates are picked up within one sweep (~30 min).
+DISCO_BATCH_DATES = 8
 
-# Cinemark throttles at roughly ~30-35 requests per ~90s window (per IP). With
-# ~33 showtimes, checking them all in one run trips that. So we split them into
-# SHARD_COUNT groups and check one group per run, alternating each 5-min tick.
-# 2 shards -> ~16 requests/run (no throttling), each showtime checked every
-# ~10 min. Set to 1 to disable sharding and check everything every run.
-SHARD_COUNT = 2
+# Adaptive sharding: seat maps are split into shards and one shard is checked per
+# run, alternating each 5-min tick. The shard COUNT is chosen automatically so a
+# run never fetches more than this many seat maps, no matter how many dates exist.
+# More dates -> more shards -> each showtime checked every (shards * 5) minutes.
+MAX_SEATMAPS_PER_RUN = 16
 
 # Send a "still alive, no matching seats yet" heartbeat at most this often
 # (hours), so you know the watcher is running even when there's nothing to alert.
@@ -175,98 +181,164 @@ def get(url):
     raise last_exc
 
 
-# ---- showtime discovery (cached) -------------------------------------------
+# ---- showtime discovery (incremental, cached in state) ---------------------
 
-def discover_showtimes():
-    """Return list of dicts: {date, time, showtime_iso, showtime_id, url}.
+def parse_day(page, iso):
+    """Matching target showtimes on one date's theater page -> list of dicts."""
+    out, seen = [], set()
+    for theater, sid, movie, when in LINK_RE.findall(page):
+        if theater != THEATER_ID or movie != MOVIE_ID:
+            continue
+        day, clock = when.split("T")
+        if day != iso or clock not in TARGET_TIMES or sid in seen:
+            continue
+        seen.add(sid)
+        out.append({
+            "date": iso, "time": clock, "showtime_iso": when, "showtime_id": sid,
+            "url": SEATMAP_URL.format(theater=theater, sid=sid,
+                                      movie=movie, when=quote(when)),
+        })
+    return out
 
-    Walks forward from start_date() with NO fixed end date, so dates Cinemark adds
-    later are picked up automatically. Stops once the theater has no showtimes at
-    all for STOP_AFTER_EMPTY_DAYS consecutive days (past the booking horizon), or
-    at the MAX_LOOKAHEAD_DAYS safety cap.
+
+def _load_map(state):
+    """The cached {date -> [showtimes]} map, migrating the old flat-list format."""
+    smap = state.get("showtimes_map")
+    if smap is None and state.get("showtimes"):     # migrate pre-incremental cache
+        smap = {}
+        for s in state["showtimes"]:
+            smap.setdefault(s["date"], []).append(s)
+    return smap or {}
+
+
+def _flatten_upcoming(smap):
+    return upcoming([s for day in smap.values() for s in day])
+
+
+def advance_discovery(state):
+    """Probe up to DISCO_BATCH_DATES dates this run via a persistent cursor.
+
+    The cursor walks forward through the booking horizon across successive runs and
+    loops back to the start once it passes the horizon (STOP_AFTER_EMPTY_DAYS with
+    no theater showtimes), so the map stays fresh and new dates get picked up while
+    each run makes only a handful of discovery requests.
     """
-    found = []
-    empty_streak = 0
-    d = start_date()
+    smap = _load_map(state)
+    start = start_date()
     hard_end = now_local().date() + dt.timedelta(days=MAX_LOOKAHEAD_DAYS)
-    while d <= hard_end:
-        iso = d.isoformat()
+
+    for k in [k for k in smap if dt.date.fromisoformat(k) < start]:
+        smap.pop(k)                                 # drop dates now in the past
+
+    cur = dt.date.fromisoformat(state["disco_cursor"]) if state.get("disco_cursor") else start
+    if not (start <= cur <= hard_end):
+        cur, state["disco_streak"] = start, 0
+    streak = state.get("disco_streak", 0)
+
+    for _ in range(DISCO_BATCH_DATES):
+        if cur > hard_end:
+            cur, streak = start, 0
+            break
+        iso = cur.isoformat()
         try:
             page = html.unescape(get(f"{THEATER_SLUG_URL}?showDate={iso}"))
         except Exception as e:
             log(f"  ! failed to load showtimes for {iso}: {e}")
-            d += dt.timedelta(days=1)
+            cur += dt.timedelta(days=1)
             continue
 
-        # No showtimes for ANY movie -> we may have passed the booking horizon.
-        if not ANY_SHOWTIME_RE.search(page):
-            empty_streak += 1
-            if empty_streak >= STOP_AFTER_EMPTY_DAYS:
-                log(f"  no theater showtimes for {empty_streak} days through "
-                    f"{iso} — reached booking horizon, stopping.")
+        if not ANY_SHOWTIME_RE.search(page):        # no movie at all this day
+            smap.pop(iso, None)
+            streak += 1
+            if streak >= STOP_AFTER_EMPTY_DAYS:
+                log(f"  booking horizon reached near {iso}; sweep loops to {start}.")
+                cur, streak = start, 0
                 break
-            d += dt.timedelta(days=1)
-            continue
-        empty_streak = 0
+        else:
+            streak = 0
+            day_shows = parse_day(page, iso)
+            if day_shows:
+                smap[iso] = day_shows
+                log(f"  {iso}: showtimes "
+                    f"{sorted(s['showtime_id'] for s in day_shows)}")
+            else:
+                smap.pop(iso, None)
+        cur += dt.timedelta(days=1)
 
-        seen = set()
-        for theater, sid, movie, when in LINK_RE.findall(page):
-            if theater != THEATER_ID or movie != MOVIE_ID:
-                continue
-            day, clock = when.split("T")
-            if day != iso or clock not in TARGET_TIMES or sid in seen:
-                continue
-            seen.add(sid)
-            found.append({
-                "date": iso, "time": clock, "showtime_iso": when,
-                "showtime_id": sid,
-                "url": SEATMAP_URL.format(theater=theater, sid=sid,
-                                          movie=movie, when=quote(when)),
-            })
-        if seen:
-            log(f"  {iso}: showtimes {sorted(seen)}")
-        d += dt.timedelta(days=1)
+    state["showtimes_map"] = smap
+    state["disco_cursor"] = cur.isoformat()
+    state["disco_streak"] = streak
+    return _flatten_upcoming(smap)
+
+
+def full_discovery():
+    """One uncapped sweep of the whole horizon (used by --list; not the schedule)."""
+    found, streak = [], 0
+    cur = start_date()
+    hard_end = now_local().date() + dt.timedelta(days=MAX_LOOKAHEAD_DAYS)
+    while cur <= hard_end:
+        iso = cur.isoformat()
+        try:
+            page = html.unescape(get(f"{THEATER_SLUG_URL}?showDate={iso}"))
+        except Exception as e:
+            log(f"  ! failed to load showtimes for {iso}: {e}")
+            cur += dt.timedelta(days=1)
+            continue
+        if not ANY_SHOWTIME_RE.search(page):
+            streak += 1
+            if streak >= STOP_AFTER_EMPTY_DAYS:
+                break
+            cur += dt.timedelta(days=1)
+            continue
+        streak = 0
+        day_shows = parse_day(page, iso)
+        found.extend(day_shows)
+        if day_shows:
+            log(f"  {iso}: showtimes {sorted(s['showtime_id'] for s in day_shows)}")
+        cur += dt.timedelta(days=1)
     return found
 
 
 def get_showtimes(state, force=False):
-    """Use cached discovery unless it's stale/missing/forced."""
-    ts = state.get("showtimes_ts", 0)
-    age_min = (time.time() - ts) / 60
-    cached = state.get("showtimes")
-    if not force and cached and age_min < REDISCOVER_EVERY_MIN:
-        log(f"Using cached showtimes ({len(cached)} shows, {age_min:.0f} min old).")
-        return cached
-    log("Discovering showtimes...")
-    shows = discover_showtimes()
-    if shows:                       # only overwrite cache on a good discovery
-        state["showtimes"] = shows
-        state["showtimes_ts"] = time.time()
-    else:
-        log("  ! discovery returned nothing; keeping previous cache.")
-        shows = cached or []
-    return shows
+    """Advance the incremental sweep (or do a full re-seed when forced)."""
+    if force:
+        log("Full re-discovery (fresh)...")
+        shows = full_discovery()
+        smap = {}
+        for s in shows:
+            smap.setdefault(s["date"], []).append(s)
+        state["showtimes_map"] = smap
+        state["disco_cursor"] = start_date().isoformat()
+        state["disco_streak"] = 0
+        state.pop("showtimes", None)                # retire old-format key
+        return upcoming(shows)
+    return advance_discovery(state)
 
 
 # ---- sharding ---------------------------------------------------------------
 
-def select_shard(shows, args):
+def shard_count_for(n):
+    """How many shards to keep a run at <= MAX_SEATMAPS_PER_RUN seat maps."""
+    return max(1, math.ceil(n / MAX_SEATMAPS_PER_RUN))
+
+
+def select_shard(shows, args, shard_count):
     """Pick the subset of showtimes to check this run.
 
-    Showtimes are ordered and dealt round-robin into SHARD_COUNT groups (so each
+    Showtimes are ordered and dealt round-robin into `shard_count` groups (so each
     group spans the whole date range, not one contiguous block). Which group runs
     is chosen from the current 5-minute clock tick, so consecutive scheduled runs
     alternate through the shards. Override with --shard=N for testing.
     """
     ordered = sorted(shows, key=lambda s: s["showtime_iso"])
-    if SHARD_COUNT <= 1:
+    if shard_count <= 1:
         return ordered, 0
 
-    bucket = int(time.time() // 300) % SHARD_COUNT   # which 5-min tick we're on
+    bucket = int(time.time() // 300) % shard_count   # which 5-min tick we're on
     for a in args:
         if a.startswith("--shard="):
-            bucket = int(a.split("=", 1)[1]) % SHARD_COUNT
-    shard = [s for i, s in enumerate(ordered) if i % SHARD_COUNT == bucket]
+            bucket = int(a.split("=", 1)[1]) % shard_count
+    shard = [s for i, s in enumerate(ordered) if i % shard_count == bucket]
     return shard, bucket
 
 
@@ -398,14 +470,15 @@ def main():
     state = load_state()
 
     if "--list" in args:
-        for s in upcoming(get_showtimes(state, force=True)):
+        for s in upcoming(full_discovery()):
             print(f"{s['showtime_iso']}  id={s['showtime_id']}  {s['url']}")
         return
 
     dry_run = "--dry-run" in args
-    all_shows = upcoming(get_showtimes(state, force="--fresh" in args))
-    shows, bucket = select_shard(all_shows, args)
-    log(f"Shard {bucket + 1}/{SHARD_COUNT}: checking {len(shows)} "
+    all_shows = get_showtimes(state, force="--fresh" in args)
+    shard_count = shard_count_for(len(all_shows))
+    shows, bucket = select_shard(all_shows, args, shard_count)
+    log(f"Shard {bucket + 1}/{shard_count}: checking {len(shows)} "
         f"of {len(all_shows)} showtime(s).")
 
     hits, failed = scan(shows)
