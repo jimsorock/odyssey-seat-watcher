@@ -182,11 +182,26 @@ it on time. Using the free [cron-job.org](https://cron-job.org):
 2. On cron-job.org, create a job that runs every 5 minutes:
    - URL: `https://api.github.com/repos/<you>/odyssey-seat-watcher/actions/workflows/watch.yml/dispatches`
    - Method: `POST`
-   - Headers: `Authorization: Bearer <YOUR_TOKEN>`, `Accept: application/vnd.github+json`
    - Body: `{"ref":"main"}`
+   - Headers:
+     ```
+     Authorization: Bearer <YOUR_TOKEN>
+     Accept: application/vnd.github+json
+     Content-Type: application/json
+     X-GitHub-Api-Version: 2022-11-28
+     ```
 
-A successful dispatch returns HTTP 204. Keep the GitHub `schedule` block as a
-fallback — the adaptive sizing means the two coexist fine.
+`Content-Type` and `X-GitHub-Api-Version` aren't strictly required — GitHub parses
+the JSON body either way — but setting them explicitly avoids the scheduler sending
+the body with an unexpected encoding, and pins the API version.
+
+A successful dispatch returns **HTTP 204** with an empty body. Common failures:
+`401` = bad/expired token, `403` = token lacks **Actions: Read and write** on this
+repo, `404` = wrong owner/repo/workflow filename (or the token can't see the repo),
+`422` = the `ref` doesn't exist (must be `main`).
+
+Keep the GitHub `schedule` block as a fallback — the adaptive run sizing means the
+two firing together coexist fine.
 
 ## Good to know
 
