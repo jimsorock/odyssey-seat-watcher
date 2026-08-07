@@ -44,8 +44,30 @@ keep every run well under that cap (and under the Actions job timeout):
   showtimes exist, so a run never fetches more than `MAX_SEATMAPS_PER_RUN` seat maps.
   More dates → more shards → each showtime is checked every *(shards × 5)* minutes.
 
+- **Near-window seat watching** (`WATCH_AHEAD_DAYS`, default **14**): only showtimes
+  within the next two weeks get a seat-map request each run. This is what keeps the
+  shard count — and therefore the re-check interval — low.
+
 Net effect: a run makes roughly 20–24 requests total and finishes in well under a
 minute, regardless of how many dates get added.
+
+### Watching seats vs. watching the schedule
+
+These are deliberately separate, because they cost very different amounts:
+
+| | Scope | Cost | You get |
+|---|---|---|---|
+| **Seat watching** | next `WATCH_AHEAD_DAYS` days | 1 request per showtime, every run | alert when a *seat* opens |
+| **Schedule watching** | the entire booking horizon | free — discovery already sweeps it | alert when a *showtime* is added |
+
+So limiting the seat window keeps checks fast **without** going blind to the future:
+if Cinemark puts a brand-new date on sale three weeks out, you still get a
+"🆕 New showtime(s) on sale" message, and that date starts getting seat-watched
+automatically once it comes within the window. Set `NOTIFY_NEW_SHOWTIMES = False`
+to turn those off, or `WATCH_AHEAD_DAYS = None` to seat-watch every date.
+
+New-showtime alerts stay silent until the sweep has covered the whole horizon twice,
+so the initial fill-in never reports the existing schedule as "new".
 
 ---
 
@@ -108,8 +130,8 @@ TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... python watch.py   # real run
 All settings are constants at the top of [`watch.py`](watch.py):
 `TARGET_TIMES`, `SEASON_START`, `WANTED_ROWS`, `SEAT_MIN` / `SEAT_MAX`,
 `WANTED_SEAT_TYPES` (add `"companion"` if you'd accept a companion seat),
-`HEARTBEAT_EVERY_HOURS`, and the throttle knobs `DISCO_BATCH_DATES` /
-`MAX_SEATMAPS_PER_RUN`.
+`HEARTBEAT_EVERY_HOURS`, `WATCH_AHEAD_DAYS` / `NOTIFY_NEW_SHOWTIMES`, and the
+throttle knobs `DISCO_BATCH_DATES` / `MAX_SEATMAPS_PER_RUN`.
 
 ### Heartbeat
 

@@ -97,6 +97,14 @@ DISCO_BATCH_DATES = 8
 # More dates -> more shards -> each showtime checked every (shards * 5) minutes.
 MAX_SEATMAPS_PER_RUN = 16
 
+# SEAT-watching is limited to showtimes within this many days, which keeps the
+# shard count (and so the re-check interval) low. SCHEDULE-watching is NOT limited:
+# discovery still sweeps the whole horizon, and NOTIFY_NEW_SHOWTIMES alerts you as
+# soon as a showtime appears on ANY future date — you just don't burn a request per
+# run watching its seats until it comes within the window. None = watch all dates.
+WATCH_AHEAD_DAYS = 14
+NOTIFY_NEW_SHOWTIMES = True
+
 # Send a "still alive, no matching seats yet" heartbeat at most this often
 # (hours), so you know the watcher is running even when there's nothing to alert.
 # Any real seat alert also resets this timer. Set to 0 to disable heartbeats.
@@ -248,6 +256,7 @@ def advance_discovery(state):
     for _ in range(DISCO_BATCH_DATES):
         if cur > hard_end:
             cur, streak = start, 0
+            state["sweeps"] = state.get("sweeps", 0) + 1
             break
         iso = cur.isoformat()
         try:
@@ -263,6 +272,7 @@ def advance_discovery(state):
             if streak >= STOP_AFTER_EMPTY_DAYS:
                 log(f"  booking horizon reached near {iso}; sweep loops to {start}.")
                 cur, streak = start, 0
+                state["sweeps"] = state.get("sweeps", 0) + 1
                 break
         else:
             streak = 0
@@ -326,6 +336,43 @@ def get_showtimes(state, force=False):
 
 
 # ---- sharding ---------------------------------------------------------------
+
+def within_window(shows):
+    """Showtimes near enough to be worth spending a seat-map request on."""
+    if not WATCH_AHEAD_DAYS:
+        return shows
+    cutoff = now_local().date() + dt.timedelta(days=WATCH_AHEAD_DAYS)
+    return [s for s in shows if dt.date.fromisoformat(s["date"]) <= cutoff]
+
+
+def detect_new_showtimes(state, all_shows):
+    """Showtimes seen for the first time (across the WHOLE horizon, not just the
+    seat-watching window).
+
+    Returns [] until the incremental sweep has covered the horizon TWICE. One sweep
+    is not enough: the run that completes sweep #1 has itself just probed several
+    dates for the first time, and those would look "new". Waiting for the second
+    sweep means the whole horizon is already recorded before anything is reported.
+    """
+    ids = {s["showtime_id"] for s in all_shows}
+    known = set(state.get("known_showtime_ids", []))
+    seeded = state.get("sweeps", 0) >= 2
+    # Store only still-upcoming ids so this never grows without bound.
+    state["known_showtime_ids"] = sorted(ids)
+    if not (NOTIFY_NEW_SHOWTIMES and seeded):
+        return []
+    return [s for s in all_shows if s["showtime_id"] not in known]
+
+
+def new_showtimes_message(new_shows):
+    lines = ["\U0001F195 New Odyssey (IMAX 70mm) showtime(s) on sale:\n"]
+    for s in sorted(new_shows, key=lambda x: x["showtime_iso"]):
+        t12 = dt.datetime.strptime(s["time"], "%H:%M:%S").strftime("%-I:%M %p")
+        lines.append(f"{s['date']}  {t12}")
+        lines.append(s["url"])
+        lines.append("")
+    return "\n".join(lines).strip()
+
 
 def shard_count_for(n):
     """How many shards to keep a run at <= MAX_SEATMAPS_PER_RUN seat maps."""
@@ -511,10 +558,18 @@ def main():
 
     dry_run = "--dry-run" in args
     all_shows = get_showtimes(state, force="--fresh" in args)
-    shard_count = shard_count_for(len(all_shows))
-    shows, bucket = select_shard(all_shows, args, shard_count)
+
+    # Schedule watching spans the whole horizon; seat watching only the near window.
+    added = detect_new_showtimes(state, all_shows)
+    pool = within_window(all_shows)
+    if len(pool) != len(all_shows):
+        log(f"{len(all_shows)} showtime(s) known; seat-watching the "
+            f"{len(pool)} within {WATCH_AHEAD_DAYS} days.")
+
+    shard_count = shard_count_for(len(pool))
+    shows, bucket = select_shard(pool, args, shard_count)
     log(f"Shard {bucket + 1}/{shard_count}: checking {len(shows)} "
-        f"of {len(all_shows)} showtime(s).")
+        f"of {len(pool)} showtime(s).")
 
     hits, failed = scan(shows)
     parsed_keys = set(hits)
@@ -524,14 +579,14 @@ def main():
     # Carry forward known seats for showtimes we skipped (other shard) or that
     # failed to load, so sharding/transient errors never drop state or trigger a
     # false re-alert when the seat is "rediscovered" next cycle.
-    # Carry forward ONLY still-upcoming showtimes: once a showtime has started it
-    # drops out of all_shows and can never be re-checked, so without this its seats
-    # would linger in state forever and be reported as "still open".
-    known_ids = {s["showtime_id"] for s in all_shows}
+    # Carry forward ONLY showtimes still in the seat-watching pool: once a showtime
+    # has started it drops out and can never be re-checked, so without this its
+    # seats would linger in state forever and be reported as "still open".
+    pool_ids = {s["showtime_id"] for s in pool}
     checked_ok = {s["showtime_id"] for s in shows} - failed
     carried = {k for k in previous
-               if k.partition(":")[0] in known_ids - checked_ok}
-    stale = {k for k in previous if k.partition(":")[0] not in known_ids}
+               if k.partition(":")[0] in pool_ids - checked_ok}
+    stale = {k for k in previous if k.partition(":")[0] not in pool_ids}
     if stale:
         log(f"Purged {len(stale)} seat(s) from past showtimes.")
     new_keys = parsed_keys - previous
@@ -543,6 +598,12 @@ def main():
         log("No matching seats available right now.")
 
     sent = False
+    if added:
+        log(f"NEW showtime(s) on sale: "
+            f"{sorted(s['showtime_iso'] for s in added)} — alerting.")
+        send_telegram(new_showtimes_message(added), dry_run=dry_run)
+        sent = True
+
     if new_keys:
         log(f"NEW since last run: {sorted(new_keys)} — alerting.")
         send_telegram(format_message(hits, new_keys), dry_run=dry_run)
@@ -554,7 +615,7 @@ def main():
     # a real alert this run (you just heard from it), or if not yet due.
     if not sent and heartbeat_due(state):
         log("Heartbeat due — sending status message.")
-        send_telegram(heartbeat_message(all_shows, state["available"]),
+        send_telegram(heartbeat_message(pool, state["available"]),
                       dry_run=dry_run)
         sent = True
 
