@@ -452,15 +452,40 @@ def heartbeat_due(state):
     return (time.time() - last) >= HEARTBEAT_EVERY_HOURS * 3600
 
 
-def heartbeat_message(all_shows, available_count):
+def _seat_sort_key(seat):
+    m = re.match(r"([A-Z]+)(\d+)", seat)
+    return (m.group(1), int(m.group(2))) if m else (seat, 0)
+
+
+def heartbeat_message(all_shows, available_keys):
+    """Status message, broken down by showtime.
+
+    Only seats belonging to a CURRENTLY UPCOMING showtime are reported, so a
+    heartbeat can never claim seats are open for a date that has already passed.
+    """
     now = now_local().strftime("%Y-%m-%d %-I:%M %p %Z")
-    if available_count:
-        seat_note = (f"{available_count} matching seat(s) currently open "
-                     f"(already alerted).")
+    by_id = {s["showtime_id"]: s for s in all_shows}
+
+    groups = {}
+    for k in available_keys:
+        sid, _, seat = k.partition(":")
+        s = by_id.get(sid)
+        if not s:                       # past/unknown showtime — never report it
+            continue
+        groups.setdefault((s["date"], s["time"]), []).append(seat)
+
+    lines = [f"\U0001F440 Odyssey watcher is alive — {now}",
+             f"Watching {len(all_shows)} upcoming showtime(s)."]
+    if groups:
+        total = sum(len(v) for v in groups.values())
+        lines.append(f"{total} matching seat(s) still open (already alerted):")
+        for (date, clock), seats in sorted(groups.items()):
+            t12 = dt.datetime.strptime(clock, "%H:%M:%S").strftime("%-I:%M %p")
+            lines.append(f"  {date} {t12}: "
+                         f"{', '.join(sorted(seats, key=_seat_sort_key))}")
     else:
-        seat_note = "No matching seats open yet."
-    return (f"\U0001F440 Odyssey watcher is alive — {now}\n"
-            f"Watching {len(all_shows)} upcoming showtime(s). {seat_note}")
+        lines.append("No matching seats open yet.")
+    return "\n".join(lines)
 
 
 # ---- main -------------------------------------------------------------------
@@ -489,8 +514,16 @@ def main():
     # Carry forward known seats for showtimes we skipped (other shard) or that
     # failed to load, so sharding/transient errors never drop state or trigger a
     # false re-alert when the seat is "rediscovered" next cycle.
+    # Carry forward ONLY still-upcoming showtimes: once a showtime has started it
+    # drops out of all_shows and can never be re-checked, so without this its seats
+    # would linger in state forever and be reported as "still open".
+    known_ids = {s["showtime_id"] for s in all_shows}
     checked_ok = {s["showtime_id"] for s in shows} - failed
-    carried = {k for k in previous if k.split(":")[0] not in checked_ok}
+    carried = {k for k in previous
+               if k.partition(":")[0] in known_ids - checked_ok}
+    stale = {k for k in previous if k.partition(":")[0] not in known_ids}
+    if stale:
+        log(f"Purged {len(stale)} seat(s) from past showtimes.")
     new_keys = parsed_keys - previous
     state["available"] = sorted(parsed_keys | carried)
 
@@ -511,7 +544,7 @@ def main():
     # a real alert this run (you just heard from it), or if not yet due.
     if not sent and heartbeat_due(state):
         log("Heartbeat due — sending status message.")
-        send_telegram(heartbeat_message(all_shows, len(state["available"])),
+        send_telegram(heartbeat_message(all_shows, state["available"]),
                       dry_run=dry_run)
         sent = True
 

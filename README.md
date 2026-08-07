@@ -115,6 +115,10 @@ so you know it's running — every `HEARTBEAT_EVERY_HOURS` hours (default **6**)
 first run sends one immediately as a delivery test, and any real seat alert resets
 the timer. Set `HEARTBEAT_EVERY_HOURS = 0` to turn heartbeats off.
 
+The heartbeat lists any still-open seats broken down by showtime date/time, and
+only ever counts showtimes that are **still upcoming** — seats belonging to a
+showtime that has already started are purged from state and never reported.
+
 ---
 
 ## Good to know
