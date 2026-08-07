@@ -146,10 +146,52 @@ showtime that has already started are purged from state and never reported.
 
 ---
 
+## How often it actually runs
+
+The workflow asks for every 5 minutes (`cron: "2-59/5 * * * *"`), but **GitHub drops
+most of those ticks**. Measured over 54 hours on this repo: a median gap of **131
+minutes**, effectively **one run every ~2 hours**, with a worst case of 6 hours.
+Scheduled workflows are explicitly best-effort and get deprioritized under load.
+
+The script adapts to this on its own (see below). If you want true 5-minute checks,
+add an external trigger.
+
+### Adaptive run size
+
+Each run checks how long it's been since the last one and sizes itself:
+
+| Gap since last run | Pass | Dates probed | Seat maps | Pacing |
+|---|---|---|---|---|
+| < `FULL_PASS_AFTER_MIN` (30 min) | light | 8 | 16 | ~1.5s |
+| ≥ 30 min, or first run | **full** | 35 | 45 | ~3.2s |
+
+So if GitHub only fires once every 2 hours, that run covers the whole horizon and
+every showtime in the window. If an external trigger is firing every 5 minutes, runs
+stay small and fast. Cinemark's limit is ~30–35 requests per ~90s window and that
+window fully resets between sparse runs, so a full pass just paces slower (~14
+req/min) rather than doing less.
+
+### Optional: real 5-minute checks via an external trigger
+
+The workflow already accepts `workflow_dispatch`, so any external scheduler can fire
+it on time. Using the free [cron-job.org](https://cron-job.org):
+
+1. Create a **fine-grained personal access token** on GitHub (Settings → Developer
+   settings → Fine-grained tokens): repository access = this repo only, permission
+   **Actions: Read and write**.
+2. On cron-job.org, create a job that runs every 5 minutes:
+   - URL: `https://api.github.com/repos/<you>/odyssey-seat-watcher/actions/workflows/watch.yml/dispatches`
+   - Method: `POST`
+   - Headers: `Authorization: Bearer <YOUR_TOKEN>`, `Accept: application/vnd.github+json`
+   - Body: `{"ref":"main"}`
+
+A successful dispatch returns HTTP 204. Keep the GitHub `schedule` block as a
+fallback — the adaptive sizing means the two coexist fine.
+
 ## Good to know
 
-- **Timing:** GitHub's scheduled runs can be delayed a few minutes when their
-  queue is busy — treat "every 5 minutes" as approximate.
+- **Timing:** see "How often it actually runs" above — GitHub's own scheduler is
+  unreliable for frequent crons.
 - **Politeness / rate limits:** requests are paced ~1.5s apart with retry-and-
   backoff, plus incremental discovery and adaptive sharding (see above) so each run
   stays under Cinemark's ~30-request window. Raising `DISCO_BATCH_DATES` or

@@ -110,6 +110,18 @@ NOTIFY_NEW_SHOWTIMES = True
 # Any real seat alert also resets this timer. Set to 0 to disable heartbeats.
 HEARTBEAT_EVERY_HOURS = 6
 
+# ADAPTIVE RUN SIZE. GitHub's scheduler drops most 5-minute ticks (measured: a run
+# roughly every ~2 hours), but an external trigger hitting workflow_dispatch can fire
+# reliably every 5 minutes. Those two worlds want opposite things: a rare run should
+# cover EVERYTHING, a frequent one should stay small. So each run looks at how long
+# it's been since the last one and picks its own size. Cinemark's limit is ~30-35
+# requests per ~90s window, and that window fully resets between sparse runs, so a
+# big pass just needs slower pacing (~3s) rather than fewer requests.
+FULL_PASS_AFTER_MIN    = 30                # gap above which we do a full pass
+DISCO_BATCH_FULL_PASS  = 35                # dates probed in a full pass
+MAX_SEATMAPS_FULL_PASS = 45                # seat maps allowed in a full pass
+REQUEST_PAUSE_FULL     = (2.9, 3.6)        # slower pacing keeps a big pass legal
+
 STATE_FILE = "state.json"                  # cached across runs (see workflow)
 REQUEST_PAUSE = (1.1, 1.8)                 # random sleep range between requests
 MAX_RETRIES = 4                            # per request, on 429 / 5xx
@@ -176,6 +188,9 @@ def upcoming(shows):
     return [s for s in shows if showtime_dt(s) > now]
 
 
+PAUSE = REQUEST_PAUSE          # set per-run by plan_run(); see ADAPTIVE RUN SIZE
+
+
 def get(url):
     """GET with polite pacing + retry/backoff on 429 and 5xx."""
     last_exc = None
@@ -189,7 +204,7 @@ def get(url):
                 last_exc = requests.HTTPError(f"{r.status_code}")
                 continue
             r.raise_for_status()
-            time.sleep(random.uniform(*REQUEST_PAUSE))
+            time.sleep(random.uniform(*PAUSE))
             return r.text
         except requests.RequestException as e:
             last_exc = e
@@ -233,8 +248,8 @@ def _flatten_upcoming(smap):
     return upcoming([s for day in smap.values() for s in day])
 
 
-def advance_discovery(state):
-    """Probe up to DISCO_BATCH_DATES dates this run via a persistent cursor.
+def advance_discovery(state, batch=DISCO_BATCH_DATES):
+    """Probe up to `batch` dates this run via a persistent cursor.
 
     The cursor walks forward through the booking horizon across successive runs and
     loops back to the start once it passes the horizon (STOP_AFTER_EMPTY_DAYS with
@@ -253,7 +268,7 @@ def advance_discovery(state):
         cur, state["disco_streak"] = start, 0
     streak = state.get("disco_streak", 0)
 
-    for _ in range(DISCO_BATCH_DATES):
+    for _ in range(batch):
         if cur > hard_end:
             cur, streak = start, 0
             state["sweeps"] = state.get("sweeps", 0) + 1
@@ -319,7 +334,7 @@ def full_discovery():
     return found
 
 
-def get_showtimes(state, force=False):
+def get_showtimes(state, force=False, batch=DISCO_BATCH_DATES):
     """Advance the incremental sweep (or do a full re-seed when forced)."""
     if force:
         log("Full re-discovery (fresh)...")
@@ -332,10 +347,29 @@ def get_showtimes(state, force=False):
         state["disco_streak"] = 0
         state.pop("showtimes", None)                # retire old-format key
         return upcoming(shows)
-    return advance_discovery(state)
+    return advance_discovery(state, batch)
 
 
 # ---- sharding ---------------------------------------------------------------
+
+def plan_run(state):
+    """Size this run from how long it's been since the last one.
+
+    A long gap means the scheduler is sparse and this run may be the only one for
+    hours, so it should cover everything (bigger batches, slower pacing to stay
+    under the rate limit). A short gap means runs are frequent, so keep it small.
+    """
+    last = state.get("last_run_ts", 0)
+    gap = (time.time() - last) / 60 if last else float("inf")
+    full = gap >= FULL_PASS_AFTER_MIN
+    return {
+        "full": full,
+        "gap": gap,
+        "disco_batch": DISCO_BATCH_FULL_PASS if full else DISCO_BATCH_DATES,
+        "max_seatmaps": MAX_SEATMAPS_FULL_PASS if full else MAX_SEATMAPS_PER_RUN,
+        "pause": REQUEST_PAUSE_FULL if full else REQUEST_PAUSE,
+    }
+
 
 def within_window(shows):
     """Showtimes near enough to be worth spending a seat-map request on."""
@@ -374,9 +408,9 @@ def new_showtimes_message(new_shows):
     return "\n".join(lines).strip()
 
 
-def shard_count_for(n):
-    """How many shards to keep a run at <= MAX_SEATMAPS_PER_RUN seat maps."""
-    return max(1, math.ceil(n / MAX_SEATMAPS_PER_RUN))
+def shard_count_for(n, cap=MAX_SEATMAPS_PER_RUN):
+    """How many shards to keep a run at <= `cap` seat maps."""
+    return max(1, math.ceil(n / cap))
 
 
 def select_shard(shows, args, shard_count):
@@ -557,7 +591,17 @@ def main():
         return
 
     dry_run = "--dry-run" in args
-    all_shows = get_showtimes(state, force="--fresh" in args)
+
+    global PAUSE
+    plan = plan_run(state)
+    PAUSE = plan["pause"]
+    gap = ("no previous run" if plan["gap"] == float("inf")
+           else f"last run {plan['gap']:.0f} min ago")
+    log(f"{'FULL' if plan['full'] else 'Light'} pass ({gap}): "
+        f"up to {plan['disco_batch']} date(s) + {plan['max_seatmaps']} seat map(s).")
+
+    all_shows = get_showtimes(state, force="--fresh" in args,
+                              batch=plan["disco_batch"])
 
     # Schedule watching spans the whole horizon; seat watching only the near window.
     added = detect_new_showtimes(state, all_shows)
@@ -566,7 +610,7 @@ def main():
         log(f"{len(all_shows)} showtime(s) known; seat-watching the "
             f"{len(pool)} within {WATCH_AHEAD_DAYS} days.")
 
-    shard_count = shard_count_for(len(pool))
+    shard_count = shard_count_for(len(pool), plan["max_seatmaps"])
     shows, bucket = select_shard(pool, args, shard_count)
     log(f"Shard {bucket + 1}/{shard_count}: checking {len(shows)} "
         f"of {len(pool)} showtime(s).")
@@ -622,6 +666,7 @@ def main():
     if sent and not dry_run:
         state["heartbeat_ts"] = time.time()
 
+    state["last_run_ts"] = time.time()      # lets the next run size itself
     save_state(state)
 
 

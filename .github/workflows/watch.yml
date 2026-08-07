@@ -15,7 +15,9 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # A "full pass" (when the scheduler has been sparse) makes ~80 paced requests
+    # and takes ~6 min, more if Cinemark throttles and it has to back off.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
