@@ -47,7 +47,12 @@ THEATER_ID       = "207"
 THEATER_SLUG_URL = "https://www.cinemark.com/theatres/tx-dallas/cinemark-dallas-xd-and-imax"
 
 MOVIE_ID     = "104867"                    # The Odyssey — IMAX 70mm (from your URL)
-TARGET_TIMES = {"11:30:00", "15:15:00"}    # 11:30 am and 3:15 pm
+
+# Which showtimes to watch. None = EVERY showtime of the movie, whatever the time.
+# (Cinemark shifted the schedule mid-run — 11:30/3:15 became 11:45/3:30 from 8/21 —
+# so exact-time matching silently missed showings. None is immune to that.)
+# To narrow it again, set e.g. {"11:30:00", "15:15:00"}; times must match exactly.
+TARGET_TIMES = None
 
 # The theater is in Dallas (Central Time). "Today" and "already started" are
 # judged in this zone, NOT the GitHub runner's UTC.
@@ -144,12 +149,15 @@ def showtime_dt(show):
 def start_date():
     """First date to search: today, or the movie's opening day if that's later.
 
-    Also rolls to tomorrow once today's last target showtime (e.g. 15:15) has
-    already started, so we don't keep scanning a day whose showings are over.
+    When specific TARGET_TIMES are set, rolls to tomorrow once today's last target
+    showtime has started, so we don't keep scanning a day whose showings are over.
+    With TARGET_TIMES = None we can't know the day's last showtime, so today is
+    always kept — upcoming() drops the individual showtimes that have started.
     """
     now = now_local()
     d = max(SEASON_START, now.date())
-    if d == now.date() and now.strftime("%H:%M:%S") > max(TARGET_TIMES):
+    if TARGET_TIMES and d == now.date() and \
+            now.strftime("%H:%M:%S") > max(TARGET_TIMES):
         d += dt.timedelta(days=1)
     return d
 
@@ -190,7 +198,9 @@ def parse_day(page, iso):
         if theater != THEATER_ID or movie != MOVIE_ID:
             continue
         day, clock = when.split("T")
-        if day != iso or clock not in TARGET_TIMES or sid in seen:
+        if day != iso or sid in seen:
+            continue
+        if TARGET_TIMES and clock not in TARGET_TIMES:
             continue
         seen.add(sid)
         out.append({

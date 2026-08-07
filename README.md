@@ -4,11 +4,14 @@ Polls Cinemark for **The Odyssey (IMAX 70mm)** at **Cinemark Dallas XD and IMAX*
 and sends a **Telegram** message when a seat opens up that matches:
 
 - **Dates:** today → open-ended. The start advances daily so it never searches
-  past days (and once today's 3:15 pm show has started, today is skipped). There's
+  past days (individual showtimes drop off once they've started). There's
   no fixed end date: discovery walks forward until it passes Cinemark's booking
   horizon, so dates added later (e.g. beyond an original cutoff) are picked up
   automatically.
-- **Times:** 11:30 am and 3:15 pm
+- **Times:** every IMAX 70mm showtime (`TARGET_TIMES = None`). Cinemark shifted the
+  schedule mid-run (11:30/3:15 became 11:45/3:30 from 8/21), and exact-time matching
+  silently missed those, so all times are watched. Set `TARGET_TIMES` to a set of
+  `"HH:MM:SS"` strings to narrow it again.
 - **Seats:** rows **E–J**, seat numbers **7–21**
 
 Runs every 5 minutes on **GitHub Actions** — no server, no cost.
