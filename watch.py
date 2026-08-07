@@ -154,7 +154,9 @@ SESSION.headers.update(HEADERS)
 
 
 def log(msg):
-    print(f"[{dt.datetime.now():%H:%M:%S}] {msg}", flush=True)
+    # Theater time (Central), not the runner's clock — GitHub runners are UTC, and
+    # mixing that with the Central times in alerts made logs confusing to read.
+    print(f"[{dt.datetime.now(THEATER_TZ):%H:%M:%S %Z}] {msg}", flush=True)
 
 
 def now_local():
